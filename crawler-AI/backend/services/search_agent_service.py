@@ -3,11 +3,11 @@ import re
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 from fact_checker.answer_agent import AnswerAgentService, AnswerResponse
 from services.intent_classifier import IntentClassifier, IntentResult
-from services.ranking_service import RankedResult, SearchRanker
+from services.ranking_service import SearchRanker
 from services.web_crawler import WebCrawler
 
 
@@ -42,12 +42,12 @@ class SearchAgentService:
         with DDGS() as ddgs:
             for q in queries:
                 try:
-                    kwargs = {"max_results": per_query, "backend": "api"}
+                    kwargs = {"max_results": per_query}
                     if timelimit:
                         kwargs["timelimit"] = timelimit
                     current = list(ddgs.text(q, **kwargs) or [])
                     if not current and timelimit:
-                        current = list(ddgs.text(q, max_results=per_query, backend="api") or [])
+                        current = list(ddgs.text(q, max_results=per_query) or [])
                     results.extend(current)
                 except Exception as exc:
                     print(f"[Pipeline] Search failed for '{q}': {exc}")
@@ -88,6 +88,10 @@ class SearchAgentService:
 
     @staticmethod
     async def run_pipeline(query: str) -> Dict[str, Any]:
+        query = (query or "").strip()
+        if not query:
+            raise ValueError("Query cannot be empty")
+
         intent_result: IntentResult = await IntentClassifier.classify(query)
         intent = intent_result.intent.value
         queries = SearchAgentService._clean_queries(
@@ -110,8 +114,8 @@ class SearchAgentService:
         crawled_pages = await SearchAgentService._crawl_results(unique[:12], max_pages=8)
         ranked_results = SearchAgentService._rank(unique, crawled_pages, intent_result.keywords)
 
-        ranked_pages_dump = []
         crawled = {p.url: p for p in crawled_pages}
+        ranked_pages_dump = []
         for r in ranked_results:
             page = crawled.get(r.url)
             ranked_pages_dump.append({
@@ -147,7 +151,11 @@ class SearchAgentService:
             "note": "SearchShield AI Intelligent Search Assistant",
             "synthesized_answer": answer_result.main_answer,
             "key_points": answer_result.key_points,
+            "actionable": answer_result.actionable,
+            "action_type": answer_result.action_type,
             "action_prompt": answer_result.action_prompt,
+            "actionable_steps": answer_result.actionable_steps,
+            "follow_up_questions": answer_result.follow_up_questions,
             "jobs": [j.model_dump() for j in answer_result.jobs],
             "products": [p.model_dump() for p in answer_result.products],
             "events": [e.model_dump() for e in answer_result.events],
