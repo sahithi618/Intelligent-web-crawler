@@ -1,0 +1,161 @@
+import json 
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from services.search_agent_service import SearchAgentService
+from auth import get_current_user
+from models import  UserHistory
+from database import SessionLocal
+
+router = APIRouter(prefix="/detect", tags=["Detection"])
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+class NewsInput(BaseModel):
+    text: str
+    
+def _map_to_user_friendly(research_result):
+    """Convert structured fact-check report into naïve-user-friendly fields."""
+    score = research_result.accuracy_score
+    verdict = research_result.overall_verdict
+
+    if verdict == "VERIFIED":
+        status = "Confirmed by reliable sources"
+    elif verdict == "MOSTLY_ACCURATE":
+        status = "Mostly accurate, but check details"
+    elif verdict == "MIXED":
+        status = "Contains both accurate and uncertain information"
+    elif verdict == "LIKELY_FALSE":
+        status = "Likely false"
+    else:
+        status = "Could not verify this claim"
+
+    confidence_tier = (
+        "high" if score >= 75 else "medium" if score >= 50 else "low"
+    )
+
+    first_claim = None
+    if research_result.verdicts and len(research_result.verdicts) > 0:
+        first_claim = research_result.verdicts[0]
+    
+    # Safe extraction of claim details
+    if first_claim:
+        claim_text = first_claim.claim if hasattr(first_claim, 'claim') else "Content could not be parsed"
+        claim_verdict = first_claim.verdict if hasattr(first_claim, 'verdict') else "UNVERIFIABLE"
+        claim_reasoning = first_claim.reasoning if hasattr(first_claim, 'reasoning') else "No detailed reasoning available"
+    else:
+        claim_text = "Content could not be parsed"
+        claim_verdict = "UNVERIFIABLE"
+        claim_reasoning = "No detailed reasoning available"
+
+    return {
+        "status": status,
+        "confidence_score": f"{score}%",
+        "confidence_level": confidence_tier,
+        "summary": research_result.summary,
+        "recommendation": research_result.recommendations,
+        "key_claim": claim_text,
+        "key_claim_verdict": claim_verdict,
+        "key_claim_reason": first_claim.reasoning if first_claim else "No detailed reasoning available",
+        "note": "This is informational and not final. Verify with trusted sources before sharing."
+    }
+
+@router.post("/analyze")
+async def detect_text_detailed(
+    body: NewsInput,
+    user = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    print("Current user:", user)
+    input_text = body.text
+    """
+    Detailed crawler search and answering pipeline.
+    """
+    try:
+        # Run new search agent pipeline
+        pipeline_result = await SearchAgentService.run_pipeline(input_text)
+        print("Search pipeline result:", pipeline_result)
+        
+        user_friendly = {
+            "status": f"Found results (Intent: {pipeline_result['intent'].upper()})",
+            "confidence_score": pipeline_result["confidence_score"],
+            "confidence_level": pipeline_result["confidence_level"],
+            "summary": pipeline_result["summary"],
+            "recommendation": pipeline_result["recommendation"],
+            "key_claim": pipeline_result["key_claim"],
+            "key_claim_verdict": pipeline_result["key_claim_verdict"],
+            "key_claim_reason": pipeline_result["key_claim_reason"],
+            "note": pipeline_result["note"]
+        }
+        
+        # Save to user history
+        history_entry = UserHistory(
+            user_id=user,   
+            input_text=input_text,
+            result=json.dumps(user_friendly)
+        )
+        db.add(history_entry)
+        db.commit()
+        print("Saved search history entry:", history_entry)
+        
+        return {
+            "research_verdict": pipeline_result,
+            "combined_score": pipeline_result["confidence_score"],
+            "recommendation": pipeline_result["action_prompt"],
+            "user_friendly": user_friendly,
+            # Structured properties for frontend search agent rendering
+            "synthesized_answer": pipeline_result["synthesized_answer"],
+            "key_points": pipeline_result["key_points"],
+            "action_prompt": pipeline_result["action_prompt"],
+            "jobs": pipeline_result["jobs"],
+            "products": pipeline_result.get("products", []),
+            "events": pipeline_result.get("events", []),
+            "sources": pipeline_result["sources"],
+            "intent": pipeline_result["intent"]
+        }
+        
+    except Exception as e:
+        print(f"Error during detection: {e}")
+        # Fallback to quick detection if fact-checker fails
+        return {
+            "research_verdict": {"error": "Analysis failed due to service error"},
+            "combined_score": None,
+            "recommendation": "Please try again or contact support",
+            "user_friendly": {
+                "status": "Analysis failed",
+                "confidence_level": "low",
+                "summary": "An internal error occurred. Please try again later.",
+                "note": "If this issue persists, report it to support."
+            }
+        }
+
+
+
+@router.get("/history")
+def get_user_history(
+    user = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        history = db.query(UserHistory)\
+                    .filter(UserHistory.user_id == user)\
+                    .order_by(UserHistory.id.desc())\
+                    .all()
+        result = []
+        for item in history:
+            result.append({
+                "id": item.id,
+                "input_text": item.input_text,
+                "result": json.loads(item.result)  # convert string → JSON
+            })
+        return result
+
+    except Exception as e:
+        return {"error": str(e)}
